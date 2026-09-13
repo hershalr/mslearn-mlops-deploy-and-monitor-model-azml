@@ -1,0 +1,66 @@
+name: Repair AML compute cluster
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Recreate aml-cluster if needed
+        run: |
+          az extension add -n ml -y
+
+          RG_NAME=$(az group list --query "[?starts_with(name,'rg-ai300-l')].name | [0]" -o tsv)
+          if [ -z "$RG_NAME" ]; then
+            echo "No resource group starting with rg-ai300-l found." >&2
+            exit 1
+          fi
+
+          WS_NAME=$(az ml workspace list --resource-group "$RG_NAME" --query "[?starts_with(name,'mlw-ai300-l')].name | [0]" -o tsv)
+          if [ -z "$WS_NAME" ]; then
+            echo "No workspace starting with mlw-ai300-l found in $RG_NAME." >&2
+            exit 1
+          fi
+
+          az configure --defaults group="$RG_NAME" workspace="$WS_NAME"
+
+          STATE=$(az ml compute show -n aml-cluster --query provisioning_state -o tsv 2>/dev/null || echo "Missing")
+          echo "Current aml-cluster provisioning_state: $STATE"
+
+          if [ "$STATE" = "Succeeded" ]; then
+            echo "Cluster is healthy; nothing to do."
+            az ml compute show -n aml-cluster -o table
+            exit 0
+          fi
+
+          echo "Deleting failed/missing cluster..."
+          az ml compute delete -n aml-cluster --yes || true
+
+          for i in $(seq 1 36); do
+            if ! az ml compute show -n aml-cluster >/dev/null 2>&1; then
+              echo "Cluster delete completed."
+              break
+            fi
+            echo "Waiting for delete... ($i)"
+            sleep 10
+          done
+
+          echo "Creating aml-cluster..."
+          az ml compute create \
+            --name aml-cluster \
+            --size STANDARD_DS11_V2 \
+            --max-instances 2 \
+            --type AmlCompute
+
+          az ml compute show -n aml-cluster -o table
